@@ -2,9 +2,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
+from typing import *
 
 import transformers
-from transformers import RobertaTokenizer
+from transformers import RobertaTokenizer, PreTrainedModel
 from transformers.models.roberta.modeling_roberta import RobertaPreTrainedModel, RobertaModel, RobertaLMHead
 from transformers.models.bert.modeling_bert import BertPreTrainedModel, BertModel, BertLMPredictionHead
 from transformers.activations import gelu
@@ -37,13 +38,13 @@ class Similarity(nn.Module):
     Dot product or cosine similarity
     """
 
-    def __init__(self, temp):
+    def __init__(self, temperature:float):
         super().__init__()
-        self.temp = temp
+        self.temperature = temperature
         self.cos = nn.CosineSimilarity(dim=-1)
 
-    def forward(self, x, y):
-        return self.cos(x, y) / self.temp
+    def forward(self, x:torch.Tensor, y:torch.Tensor):
+        return self.cos(x, y) / self.temperature
 
 
 class Pooler(nn.Module):
@@ -55,14 +56,17 @@ class Pooler(nn.Module):
     'avg_top2': average of the last two layers.
     'avg_first_last': average of the first and the last layers.
     """
-    def __init__(self, pooler_type):
+    def __init__(self, pooler_type:str):
         super().__init__()
         self.pooler_type = pooler_type
         assert self.pooler_type in ["cls", "cls_before_pooler", "avg", "avg_top2", "avg_first_last"], "unrecognized pooling type %s" % self.pooler_type
 
     def forward(self, attention_mask, outputs):
+        # last_hidden: [batch, seq_len, hidden]
         last_hidden = outputs.last_hidden_state
+        # pooler_output: [batch, hidden]
         pooler_output = outputs.pooler_output
+        # hidden_state: [1+layer_size, batch, seq_len, hidden], 第一层是embedding
         hidden_states = outputs.hidden_states
 
         if self.pooler_type in ['cls_before_pooler', 'cls']:
@@ -77,55 +81,165 @@ class Pooler(nn.Module):
         elif self.pooler_type == "avg_top2":
             second_last_hidden = hidden_states[-2]
             last_hidden = hidden_states[-1]
+            # attention_mask:[batch, seq_len,seq_len] -> [batch,1=0, seq_len, 1]
+            # attention_mask:[batch, seq_len,seq_len] -> [batch, seq_len, 1=0, 1]
             pooled_result = ((last_hidden + second_last_hidden) / 2.0 * attention_mask.unsqueeze(-1)).sum(1) / attention_mask.sum(-1).unsqueeze(-1)
+            # pooled_result: [batch, seq_len, hidden]
             return pooled_result
         else:
             raise NotImplementedError
 
+class BertForConstrativeLearning(BertPreTrainedModel):
+    _keys_to_ignore_on_load_missing = [r"position_ids"]
 
-def cl_init(cls, config):
-    """
-    Contrastive learning class init function.
-    """
-    cls.pooler_type = cls.model_args.pooler_type
-    cls.pooler = Pooler(cls.model_args.pooler_type)
-    if cls.model_args.pooler_type == "cls":
-        cls.mlp = MLPLayer(config)
-    cls.sim = Similarity(temp=cls.model_args.temp)
-    cls.init_weights()
+    def __init__(self, config, *model_args, **model_kargs):
+        super().__init__(config)
+        self.model_args = model_kargs["model_args"]
+        self.bert = BertModel(config, add_pooling_layer=False)
 
-def cl_forward(cls,
-    encoder,
-    input_ids=None,
-    attention_mask=None,
-    token_type_ids=None,
-    position_ids=None,
-    head_mask=None,
-    inputs_embeds=None,
-    labels=None,
-    output_attentions=None,
-    output_hidden_states=None,
-    return_dict=None,
-    mlm_input_ids=None,
-    mlm_labels=None,
-):
+        if self.model_args.do_mlm:
+            self.lm_head = BertLMPredictionHead(config)
+
+        constrastive_learning_init(self, config)
+
+    def forward(self,
+                input_ids=None,
+                attention_mask=None,
+                token_type_ids=None,
+                position_ids=None,
+                head_mask=None,
+                inputs_embeds=None,
+                labels=None,
+                output_attentions=None,
+                output_hidden_states=None,
+                return_dict=None,
+                sent_emb=False,
+                mlm_input_ids=None,
+                mlm_labels=None,
+                ):
+        if sent_emb:
+            return sentemb_forward(self, encoder=self.bert,
+                                   input_ids=input_ids,
+                                   attention_mask=attention_mask,
+                                   token_type_ids=token_type_ids,
+                                   position_ids=position_ids,
+                                   head_mask=head_mask,
+                                   inputs_embeds=inputs_embeds,
+                                   labels=labels,
+                                   output_attentions=output_attentions,
+                                   output_hidden_states=output_hidden_states,
+                                   return_dict=return_dict,
+                                   )
+        else:
+            return constrative_learning_forward(self, encoder=self.bert,
+                                                input_ids=input_ids,
+                                                attention_mask=attention_mask,
+                                                token_type_ids=token_type_ids,
+                                                position_ids=position_ids,
+                                                head_mask=head_mask,
+                                                inputs_embeds=inputs_embeds,
+                                                labels=labels,
+                                                output_attentions=output_attentions,
+                                                output_hidden_states=output_hidden_states,
+                                                return_dict=return_dict,
+                                                mlm_input_ids=mlm_input_ids,
+                                                mlm_labels=mlm_labels,
+                                                )
+
+
+
+class RobertaForConstrativeLearning(RobertaPreTrainedModel):
+    _keys_to_ignore_on_load_missing = [r"position_ids"]
+
+    def __init__(self, config, *model_args, **model_kargs):
+        super().__init__(config)
+        self.model_args = model_kargs["model_args"]
+        self.roberta = RobertaModel(config, add_pooling_layer=False)
+
+        if self.model_args.do_mlm:
+            # 将[batch, seq_len, model_size] 用mlp来预测vocab: [batch, seq_len, vocab_size]
+            self.lm_head = RobertaLMHead(config)
+
+        constrastive_learning_init(self, config)
+
+    def forward(self,
+                input_ids=None,
+                attention_mask=None,
+                token_type_ids=None,
+                position_ids=None,
+                head_mask=None,
+                inputs_embeds=None,
+                labels=None,
+                output_attentions=None,
+                output_hidden_states=None,
+                return_dict=None,
+                sent_emb=False,
+                mlm_input_ids=None,
+                mlm_labels=None,
+                ):
+        if sent_emb:
+            return sentemb_forward(self, encoder=self.roberta,
+                                   input_ids=input_ids,
+                                   attention_mask=attention_mask,
+                                   token_type_ids=token_type_ids,
+                                   position_ids=position_ids,
+                                   head_mask=head_mask,
+                                   inputs_embeds=inputs_embeds,
+                                   labels=labels,
+                                   output_attentions=output_attentions,
+                                   output_hidden_states=output_hidden_states,
+                                   return_dict=return_dict,
+                                   )
+        else:
+            return constrative_learning_forward(self, encoder=self.roberta,
+                                                input_ids=input_ids,
+                                                attention_mask=attention_mask,
+                                                token_type_ids=token_type_ids,
+                                                position_ids=position_ids,
+                                                head_mask=head_mask,
+                                                inputs_embeds=inputs_embeds,
+                                                labels=labels,
+                                                output_attentions=output_attentions,
+                                                output_hidden_states=output_hidden_states,
+                                                return_dict=return_dict,
+                                                mlm_input_ids=mlm_input_ids,
+                                                mlm_labels=mlm_labels,
+                                                )
+
+def constrative_learning_forward(cls:Union[BertForConstrativeLearning, RobertaForConstrativeLearning],
+                                 encoder:Union[BertModel, RobertaModel],
+                                 input_ids=None,
+                                 attention_mask=None,
+                                 token_type_ids=None,
+                                 position_ids=None,
+                                 head_mask=None,
+                                 inputs_embeds=None,
+                                 labels=None,
+                                 output_attentions=None,
+                                 output_hidden_states=None,
+                                 return_dict=None,
+                                 mlm_input_ids=None,
+                                 mlm_labels=None,
+                                 ):
     return_dict = return_dict if return_dict is not None else cls.config.use_return_dict
     ori_input_ids = input_ids
     batch_size = input_ids.size(0)
     # Number of sentences in one instance
-    # 2: pair instance; 3: pair instance with a hard negative
+    # 2: pair instance;
+    # 3: pair instance with a hard negative
     num_sent = input_ids.size(1)
 
     mlm_outputs = None
     # Flatten input for encoding
     input_ids = input_ids.view((-1, input_ids.size(-1))) # (bs * num_sent, len)
-    attention_mask = attention_mask.view((-1, attention_mask.size(-1))) # (bs * num_sent len)
+    attention_mask = attention_mask.view((-1, attention_mask.size(-1))) # (bs * num_sent, len)
     if token_type_ids is not None:
         token_type_ids = token_type_ids.view((-1, token_type_ids.size(-1))) # (bs * num_sent, len)
 
     # Get raw embeddings
+    # outputs:[batch*num_sent, model_size]
     outputs = encoder(
-        input_ids,
+        input_ids=input_ids,
         attention_mask=attention_mask,
         token_type_ids=token_type_ids,
         position_ids=position_ids,
@@ -138,9 +252,11 @@ def cl_forward(cls,
 
     # MLM auxiliary objective
     if mlm_input_ids is not None:
+        # mlm_input_ids: (bs * num_sent, len)
         mlm_input_ids = mlm_input_ids.view((-1, mlm_input_ids.size(-1)))
+        # outputs:[batch*num_sent, model_size]
         mlm_outputs = encoder(
-            mlm_input_ids,
+            input_ids=mlm_input_ids,
             attention_mask=attention_mask,
             token_type_ids=token_type_ids,
             position_ids=position_ids,
@@ -152,7 +268,11 @@ def cl_forward(cls,
         )
 
     # Pooling
+    # outputs:[batch*num_sent, model_size]
+    # attention_mask: (bs * num_sent, seq_len)
+    # pooler_output:[bs*num_sent, hidden]
     pooler_output = cls.pooler(attention_mask, outputs)
+    # pooler_output:[bs, num_sent, hidden]
     pooler_output = pooler_output.view((batch_size, num_sent, pooler_output.size(-1))) # (bs, num_sent, hidden)
 
     # If using "cls", we add an extra MLP layer
@@ -161,6 +281,9 @@ def cl_forward(cls,
         pooler_output = cls.mlp(pooler_output)
 
     # Separate representation
+    # pooler_output:[bs, num_sent, hidden]
+    # z1:[bs, hidden]
+    # z2:[bs, hidden]
     z1, z2 = pooler_output[:,0], pooler_output[:,1]
 
     # Hard negative
@@ -191,7 +314,11 @@ def cl_forward(cls,
         z1 = torch.cat(z1_list, 0)
         z2 = torch.cat(z2_list, 0)
 
+    # z1: (bs x N, hidden)
+    # z2: (bs x N, hidden)
+    # cos_sim:[bs*N, bs*N]
     cos_sim = cls.sim(z1.unsqueeze(1), z2.unsqueeze(0))
+
     # Hard negative
     if num_sent >= 3:
         z1_z3_cos = cls.sim(z1.unsqueeze(1), z3.unsqueeze(0))
@@ -221,6 +348,7 @@ def cl_forward(cls,
     if not return_dict:
         output = (cos_sim,) + outputs[2:]
         return ((loss,) + output) if loss is not None else output
+
     return SequenceClassifierOutput(
         loss=loss,
         logits=cos_sim,
@@ -228,10 +356,9 @@ def cl_forward(cls,
         attentions=outputs.attentions,
     )
 
-
 def sentemb_forward(
-    cls,
-    encoder,
+    cls:PreTrainedModel,
+    encoder:PreTrainedModel,
     input_ids=None,
     attention_mask=None,
     token_type_ids=None,
@@ -271,119 +398,15 @@ def sentemb_forward(
         hidden_states=outputs.hidden_states,
     )
 
+def constrastive_learning_init(cls:Union[RobertaForConstrativeLearning, BertForConstrativeLearning], config):
+    """
+    Contrastive learning class init function.
+    """
+    cls.pooler_type = cls.model_args.pooler_type
+    cls.pooler = Pooler(cls.model_args.pooler_type)
+    if cls.model_args.pooler_type == "cls":
+        cls.mlp = MLPLayer(config)
 
-class BertForCL(BertPreTrainedModel):
-    _keys_to_ignore_on_load_missing = [r"position_ids"]
+    cls.sim = Similarity(temperature=cls.model_args.temp)
+    cls.init_weights()
 
-    def __init__(self, config, *model_args, **model_kargs):
-        super().__init__(config)
-        self.model_args = model_kargs["model_args"]
-        self.bert = BertModel(config, add_pooling_layer=False)
-
-        if self.model_args.do_mlm:
-            self.lm_head = BertLMPredictionHead(config)
-
-        cl_init(self, config)
-
-    def forward(self,
-        input_ids=None,
-        attention_mask=None,
-        token_type_ids=None,
-        position_ids=None,
-        head_mask=None,
-        inputs_embeds=None,
-        labels=None,
-        output_attentions=None,
-        output_hidden_states=None,
-        return_dict=None,
-        sent_emb=False,
-        mlm_input_ids=None,
-        mlm_labels=None,
-    ):
-        if sent_emb:
-            return sentemb_forward(self, self.bert,
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                token_type_ids=token_type_ids,
-                position_ids=position_ids,
-                head_mask=head_mask,
-                inputs_embeds=inputs_embeds,
-                labels=labels,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                return_dict=return_dict,
-            )
-        else:
-            return cl_forward(self, self.bert,
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                token_type_ids=token_type_ids,
-                position_ids=position_ids,
-                head_mask=head_mask,
-                inputs_embeds=inputs_embeds,
-                labels=labels,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                return_dict=return_dict,
-                mlm_input_ids=mlm_input_ids,
-                mlm_labels=mlm_labels,
-            )
-
-
-
-class RobertaForCL(RobertaPreTrainedModel):
-    _keys_to_ignore_on_load_missing = [r"position_ids"]
-
-    def __init__(self, config, *model_args, **model_kargs):
-        super().__init__(config)
-        self.model_args = model_kargs["model_args"]
-        self.roberta = RobertaModel(config, add_pooling_layer=False)
-
-        if self.model_args.do_mlm:
-            self.lm_head = RobertaLMHead(config)
-
-        cl_init(self, config)
-
-    def forward(self,
-        input_ids=None,
-        attention_mask=None,
-        token_type_ids=None,
-        position_ids=None,
-        head_mask=None,
-        inputs_embeds=None,
-        labels=None,
-        output_attentions=None,
-        output_hidden_states=None,
-        return_dict=None,
-        sent_emb=False,
-        mlm_input_ids=None,
-        mlm_labels=None,
-    ):
-        if sent_emb:
-            return sentemb_forward(self, self.roberta,
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                token_type_ids=token_type_ids,
-                position_ids=position_ids,
-                head_mask=head_mask,
-                inputs_embeds=inputs_embeds,
-                labels=labels,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                return_dict=return_dict,
-            )
-        else:
-            return cl_forward(self, self.roberta,
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                token_type_ids=token_type_ids,
-                position_ids=position_ids,
-                head_mask=head_mask,
-                inputs_embeds=inputs_embeds,
-                labels=labels,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                return_dict=return_dict,
-                mlm_input_ids=mlm_input_ids,
-                mlm_labels=mlm_labels,
-            )

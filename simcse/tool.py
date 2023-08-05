@@ -5,10 +5,11 @@ from numpy import ndarray
 import torch
 from torch import Tensor, device
 import transformers
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoModel, AutoTokenizer, BertTokenizerFast
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.preprocessing import normalize
 from typing import List, Dict, Tuple, Type, Union
+from transformers import BertModel, BertConfig, BertTokenizer
 
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s', datefmt='%m/%d/%Y %H:%M:%S',
                     level=logging.INFO)
@@ -24,8 +25,11 @@ class SimCSE(object):
                 num_cells_in_search: int = 10,
                 pooler = None):
 
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
-        self.model = AutoModel.from_pretrained(model_name_or_path)
+        #self.tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
+        self.tokenizer = BertTokenizerFast.from_pretrained('bert-base-chinese')
+        pretrain_model_path = "../../SimCSE-Pytorch/data/bert_tiny/"
+        #self.model = AutoModel.from_pretrained(model_name_or_path)
+        self.model = BertModel.from_pretrained(pretrain_model_path)
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = device
@@ -43,7 +47,8 @@ class SimCSE(object):
         else:
             self.pooler = "cls"
     
-    def encode(self, sentence: Union[str, List[str]], 
+    def encode(self,
+                sentence: Union[str, List[str]],
                 device: str = None, 
                 return_numpy: bool = False,
                 normalize_to_unit: bool = True,
@@ -79,7 +84,7 @@ class SimCSE(object):
                 else:
                     raise NotImplementedError
                 if normalize_to_unit:
-                    embeddings = embeddings / embeddings.norm(dim=1, keepdim=True)
+                    embeddings = embeddings / embeddings.norm(dim=1, keepdim=True) # 向量长度归一化
                 embedding_list.append(embeddings.cpu())
         embeddings = torch.cat(embedding_list, 0)
         
@@ -90,9 +95,10 @@ class SimCSE(object):
             return embeddings.numpy()
         return embeddings
     
-    def similarity(self, queries: Union[str, List[str]], 
-                    keys: Union[str, List[str], ndarray], 
-                    device: str = None) -> Union[float, ndarray]:
+    def similarity(self,
+                   queries: Union[str, List[str]],
+                   keys: Union[str, List[str], ndarray],
+                   device: str = None) -> Union[float, ndarray]:
         
         query_vecs = self.encode(queries, device=device, return_numpy=True) # suppose N queries
         
@@ -143,7 +149,11 @@ class SimCSE(object):
             sentences_or_file_path = sentences
         
         logger.info("Encoding embeddings for sentences...")
-        embeddings = self.encode(sentences_or_file_path, device=device, batch_size=batch_size, normalize_to_unit=True, return_numpy=True)
+        embeddings = self.encode(sentences_or_file_path,
+                                 device=device,
+                                 batch_size=batch_size,
+                                 normalize_to_unit=True,
+                                 return_numpy=True)
 
         logger.info("Building index...")
         self.index = {"sentences": sentences_or_file_path}
@@ -200,9 +210,7 @@ class SimCSE(object):
         self.index["sentences"] += sentences_or_file_path
         logger.info("Finished")
 
-
-    
-    def search(self, queries: Union[str, List[str]], 
+    def search(self, queries: Union[str, List[str]],
                 device: str = None, 
                 threshold: float = 0.6,
                 top_k: int = 5) -> Union[List[Tuple[str, float]], List[List[Tuple[str, float]]]]:
