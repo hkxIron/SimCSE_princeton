@@ -374,7 +374,7 @@ def sentemb_forward(
     return_dict = return_dict if return_dict is not None else cls.config.use_return_dict
 
     outputs = encoder(
-        input_ids,
+        input_ids=input_ids,
         attention_mask=attention_mask,
         token_type_ids=token_type_ids,
         position_ids=position_ids,
